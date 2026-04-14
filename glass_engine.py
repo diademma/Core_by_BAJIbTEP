@@ -1,8 +1,8 @@
 # glass_engine.py — Ultra 3D Glass DLC for Core Plugin
 # Author: @project_BAJIbTEP & AI
-# Version: 3.5.0 (Ultra 3D Release)
+# Version: 3.5.1 (Ultra 3D Release - JNI Color Fix)
 
-VERSION = "3.5.0"
+VERSION = "3.5.1"
 
 import math
 import random
@@ -72,6 +72,12 @@ class GlassEngine:
         except: return lo
 
     @staticmethod
+    def _s32(val):
+        """Конвертирует Python int в подписанный 32-битный int для Java (решение проблемы цветов)"""
+        val = int(val) & 0xFFFFFFFF
+        return val if val < 0x80000000 else val - 0x100000000
+
+    @staticmethod
     def _alpha(color_int):
         return (int(color_int) >> 24) & 0xFF
 
@@ -94,9 +100,9 @@ class GlassEngine:
             pixels = jarray(jint)(size * size)
             for i in range(size * size):
                 val = random.randint(0, 255)
-                # Легкий шум, альфа от 0 до intensity
                 alpha = random.randint(0, intensity)
-                pixels[i] = Color.argb(alpha, val, val, val)
+                # Обязательно конвертируем цвет в Signed 32-bit
+                pixels[i] = GlassEngine._s32(Color.argb(alpha, val, val, val))
             bmp.setPixels(pixels, 0, size, 0, 0, size, size)
             GlassEngine._NOISE_CACHE = bmp
             return bmp
@@ -114,11 +120,10 @@ class GlassEngine:
             canvas = Canvas(bmp)
             p = Paint()
             p.setAntiAlias(True)
-            p.setColor(Color.argb(40, 255, 255, 255))
+            p.setColor(GlassEngine._s32(Color.argb(40, 255, 255, 255)))
             p.setStrokeWidth(float(size) / 8.0)
             p.setStrokeCap(Paint.Cap.SQUARE)
             
-            # Рисуем диагонали так, чтобы они бесшовно стыковались (TileMode.REPEAT)
             canvas.drawLine(0, 0, size, size, p)
             canvas.drawLine(size, 0, size*2, size, p)
             canvas.drawLine(-size, 0, 0, size, p)
@@ -161,7 +166,7 @@ class GlassEngine:
     def _build_wallpaper_bitmap(context, width, height, blur_px, dim_alpha):
         bmp = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
         canvas = Canvas(bmp)
-        try: canvas.drawColor(Color.BLACK)
+        try: canvas.drawColor(GlassEngine._s32(Color.BLACK))
         except: pass
         
         try:
@@ -171,7 +176,6 @@ class GlassEngine:
                 GlassEngine._draw_center_crop(w, canvas, width, height)
         except Exception: pass
 
-        # Софтверный блюр (Скейлинг туда-сюда)
         if blur_px > 0:
             try:
                 factor = max(1.0, min(24.0, 1.0 + blur_px * 0.5))
@@ -185,7 +189,7 @@ class GlassEngine:
             try:
                 dim_canvas = Canvas(bmp)
                 paint = Paint()
-                paint.setColor(GlassEngine._with_alpha(Color.BLACK, dim_alpha))
+                paint.setColor(GlassEngine._s32(GlassEngine._with_alpha(Color.BLACK, dim_alpha)))
                 dim_canvas.drawRect(0, 0, width, height, paint)
             except: pass
             
@@ -203,11 +207,9 @@ class GlassEngine:
             high_alpha = int(GlassEngine._clamp(GlassEngine.RUNTIME.get("highlight_alpha", 88), 0, 255))
             border_alpha = int(GlassEngine._clamp(GlassEngine.RUNTIME.get("border_alpha", 34), 0, 255))
 
-            # 1. ОБРАБОТКА ФОНА (Только для корня шторки)
             if use_wallpaper:
                 try:
                     sdk = int(Build.SDK_INT)
-                    # Если Android старый (< 12) - рисуем обои и блюрим вручную
                     if sdk < 31 or not _HAS_RENDER_EFFECT:
                         w, h = int(view.getWidth()), int(view.getHeight())
                         if w > 0 and h > 0:
@@ -220,83 +222,73 @@ class GlassEngine:
             # 2. БАЗОВЫЙ ЦВЕТ СТЕКЛА
             base_gd = GradientDrawable()
             base_gd.setCornerRadius(radius_px)
-            base_gd.setColor(int(color_int))
+            base_gd.setColor(GlassEngine._s32(color_int))
             layers.append(base_gd)
 
-            # 3. ТЕКСТУРЫ (Шум или Полосы) - Не накладываем на рут обои, чтобы не было "грязи" на фоне
+            # 3. ТЕКСТУРЫ (Шум или Полосы)
             if not use_wallpaper:
                 tex_bmp = None
                 if glass_type == GlassEngine.GLASS_RIBBED:
                     tex_bmp = GlassEngine._build_lines_bitmap()
                 else:
-                    # Для жидкого стекла шум крупнее и прозрачнее
                     intensity = 40 if glass_type == GlassEngine.GLASS_LIQUID else 25
                     tex_bmp = GlassEngine._build_noise_bitmap(intensity=intensity)
 
                 if tex_bmp:
                     tex_draw = BitmapDrawable(context.getResources(), tex_bmp)
                     tex_draw.setTileModeXY(ShaderTileMode.REPEAT, ShaderTileMode.REPEAT)
-                    
-                    # Применяем правильный BlendMode для сверх-реалистичного слияния (только Android 29+)
                     if _HAS_BLEND_MODE:
-                        try:
-                            # OVERLAY заставляет шум "смешиваться" со светом, а не лежать серой пылью
-                            tex_draw.setBlendMode(BlendMode.OVERLAY)
+                        try: tex_draw.setBlendMode(BlendMode.OVERLAY)
                         except: pass
                     layers.append(tex_draw)
 
             # 4. 3D ОБЪЕМ И БЛИКИ (Внутренняя подсветка)
             if not use_wallpaper:
-                # Основной свет: Падает с левого верхнего угла (Top-Left)
                 glow_main = GradientDrawable()
                 glow_main.setCornerRadius(radius_px)
                 glow_main.setOrientation(GradientDrawable.Orientation.TL_BR)
                 
                 if glass_type == GlassEngine.GLASS_GLOSSY:
-                    # Глянцевое: жесткие резкие блики
                     glow_main.setColors(jarray(jint)([
-                        GlassEngine._with_alpha(Color.WHITE, int(high_alpha * 1.2)),
-                        GlassEngine._with_alpha(Color.WHITE, int(high_alpha * 0.4)),
-                        Color.TRANSPARENT, Color.TRANSPARENT,
-                        GlassEngine._with_alpha(Color.BLACK, int(high_alpha * 0.6))
+                        GlassEngine._s32(GlassEngine._with_alpha(Color.WHITE, int(high_alpha * 1.2))),
+                        GlassEngine._s32(GlassEngine._with_alpha(Color.WHITE, int(high_alpha * 0.4))),
+                        GlassEngine._s32(Color.TRANSPARENT), 
+                        GlassEngine._s32(Color.TRANSPARENT),
+                        GlassEngine._s32(GlassEngine._with_alpha(Color.BLACK, int(high_alpha * 0.6)))
                     ]))
                 else:
-                    # Матовое/Остальные: мягкое рассеянное свечение
                     glow_main.setColors(jarray(jint)([
-                        GlassEngine._with_alpha(Color.WHITE, high_alpha),
-                        GlassEngine._with_alpha(Color.WHITE, int(high_alpha * 0.15)),
-                        Color.TRANSPARENT, Color.TRANSPARENT,
-                        GlassEngine._with_alpha(Color.BLACK, int(high_alpha * 0.4))
+                        GlassEngine._s32(GlassEngine._with_alpha(Color.WHITE, high_alpha)),
+                        GlassEngine._s32(GlassEngine._with_alpha(Color.WHITE, int(high_alpha * 0.15))),
+                        GlassEngine._s32(Color.TRANSPARENT), 
+                        GlassEngine._s32(Color.TRANSPARENT),
+                        GlassEngine._s32(GlassEngine._with_alpha(Color.BLACK, int(high_alpha * 0.4)))
                     ]))
                 layers.append(glow_main)
 
-                # Дополнительный рефлекс (свет снизу) для глянца и жидкостей
                 if glass_type in (GlassEngine.GLASS_GLOSSY, GlassEngine.GLASS_LIQUID):
                     glow_sec = GradientDrawable()
                     glow_sec.setCornerRadius(radius_px)
                     glow_sec.setOrientation(GradientDrawable.Orientation.BOTTOM_TOP)
                     glow_sec.setColors(jarray(jint)([
-                        GlassEngine._with_alpha(Color.WHITE, int(high_alpha * 0.5)),
-                        Color.TRANSPARENT, Color.TRANSPARENT
+                        GlassEngine._s32(GlassEngine._with_alpha(Color.WHITE, int(high_alpha * 0.5))),
+                        GlassEngine._s32(Color.TRANSPARENT), 
+                        GlassEngine._s32(Color.TRANSPARENT)
                     ]))
                     layers.append(glow_sec)
 
             # 5. ОСТРЫЕ ГРАНИ (Рамка)
-            # В Android 3D-рамку можно сделать градиентной только через LayerDrawable с инсетами, 
-            # но для скорости используем прозрачную обводку с высокой яркостью
             if border_alpha > 0 and not use_wallpaper:
                 rim = GradientDrawable()
                 rim.setCornerRadius(radius_px)
-                rim.setColor(Color.TRANSPARENT)
-                rim.setStroke(AndroidUtilities.dp(1), GlassEngine._with_alpha(Color.WHITE, border_alpha))
+                rim.setColor(GlassEngine._s32(Color.TRANSPARENT))
+                rim.setStroke(AndroidUtilities.dp(1), GlassEngine._s32(GlassEngine._with_alpha(Color.WHITE, border_alpha)))
                 layers.append(rim)
 
             # СБОРКА СЛОЕВ
             layer_drawable = LayerDrawable(DrawableArr(layers))
             
-            try:
-                # ОЧЕНЬ ВАЖНО: Заставляем View обрезать шум (BitmapDrawable) по радиусу углов!
-                view.setClipToOutline(True)
+            try: view.setClipToOutline(True)
             except Exception: pass
             
             try: view.setBackground(layer_drawable)
