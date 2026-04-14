@@ -1,8 +1,8 @@
 # glass_engine.py — Ultra 3D Glass DLC for Core Plugin
 # Author: @project_BAJIbTEP & AI
-# Version: 4.0.0 (Ultra 3D Pro)
+# Version: 4.1.0 (ColorSpace Fix & Enhanced Styles)
 
-VERSION = "4.0.0"
+VERSION = "4.1.0"
 
 import math
 import random
@@ -73,9 +73,15 @@ class GlassEngine:
 
     @staticmethod
     def _s32(val):
-        """Лекарство от крашей: конвертирует Python int в Signed 32-bit Java int"""
+        """Лекарство от JNI крашей (только для setColors и drawColor)"""
         val = int(val) & 0xFFFFFFFF
         return val if val < 0x80000000 else val - 0x100000000
+
+    @staticmethod
+    def _paint_color(alpha, r, g, b):
+        """Безопасный способ задать цвет в Paint, избегая ColorSpace Error"""
+        # Сдвиг битов напрямую, чтобы избежать вызова Color.argb() который ломается на Android 12+
+        return GlassEngine._s32((alpha << 24) | (r << 16) | (g << 8) | b)
 
     @staticmethod
     def _alpha(color_int):
@@ -84,14 +90,13 @@ class GlassEngine:
     @staticmethod
     def _with_alpha(color_int, alpha):
         alpha = int(GlassEngine._clamp(alpha, 0, 255))
-        return (int(color_int) & 0x00FFFFFF) | (alpha << 24)
+        return GlassEngine._s32((int(color_int) & 0x00FFFFFF) | (alpha << 24))
 
     # =========================================================
-    # ГЕНЕРАТОРЫ ТЕКСТУР (Noise / Grid 3D)
+    # ГЕНЕРАТОРЫ ТЕКСТУР
     # =========================================================
     @staticmethod
     def _build_noise_bitmap(size=128, intensity=25):
-        """Генерирует бесшовную текстуру матового шума (Frosted/Liquid Glass grain)"""
         if GlassEngine._NOISE_CACHE and GlassEngine._NOISE_CACHE.get("intensity") == intensity:
             return GlassEngine._NOISE_CACHE.get("bmp")
         
@@ -99,10 +104,9 @@ class GlassEngine:
             bmp = Bitmap.createBitmap(size, size, Bitmap.Config.ARGB_8888)
             pixels = jarray(jint)(size * size)
             for i in range(size * size):
-                # Черно-белый цифровой шум (соль и перец)
                 val = random.choice([0, 255])
                 alpha = random.randint(0, intensity)
-                pixels[i] = GlassEngine._s32(Color.argb(alpha, val, val, val))
+                pixels[i] = GlassEngine._paint_color(alpha, val, val, val)
             bmp.setPixels(pixels, 0, size, 0, 0, size, size)
             GlassEngine._NOISE_CACHE = {"intensity": intensity, "bmp": bmp}
             return bmp
@@ -112,7 +116,6 @@ class GlassEngine:
 
     @staticmethod
     def _build_grid_bitmap(size=24):
-        """Генерирует 3D-сетку с фаской для рифленого стекла (Ribbed)"""
         if GlassEngine._GRID_CACHE:
             return GlassEngine._GRID_CACHE
         try:
@@ -120,14 +123,14 @@ class GlassEngine:
             canvas = Canvas(bmp)
             
             p_light = Paint()
-            p_light.setColor(GlassEngine._s32(Color.argb(60, 255, 255, 255)))
+            # Безопасная установка цвета через _paint_color
+            p_light.setColor(GlassEngine._paint_color(60, 255, 255, 255))
             p_light.setStrokeWidth(2.0)
             
             p_dark = Paint()
-            p_dark.setColor(GlassEngine._s32(Color.argb(40, 0, 0, 0)))
+            p_dark.setColor(GlassEngine._paint_color(40, 0, 0, 0))
             p_dark.setStrokeWidth(2.0)
             
-            # Эффект фаски: свет падает сверху и слева, тень снизу и справа
             canvas.drawLine(0, 0, size, 0, p_light)
             canvas.drawLine(0, 0, 0, size, p_light)
             canvas.drawLine(size, 0, size, size, p_dark)
@@ -140,7 +143,7 @@ class GlassEngine:
             return None
 
     # =========================================================
-    # ФОЛЛБЭК ДЛЯ ОБОЕВ (Всегда рендерит фон!)
+    # ФОЛЛБЭК ДЛЯ ОБОЕВ
     # =========================================================
     @staticmethod
     def _draw_center_crop(drawable, canvas, width, height):
@@ -169,16 +172,14 @@ class GlassEngine:
 
     @staticmethod
     def _build_wallpaper_bitmap(context, width, height, blur_px, dim_alpha):
-        # Для экономии ОЗУ мы сразу сжимаем холст пропорционально силе блюра
         factor = max(1.0, min(16.0, 1.0 + blur_px * 0.4)) if blur_px > 0 else 1.0
         target_w = max(1, int(width / factor))
         target_h = max(1, int(height / factor))
         
         bmp = Bitmap.createBitmap(target_w, target_h, Bitmap.Config.ARGB_8888)
         canvas = Canvas(bmp)
-        canvas.drawColor(GlassEngine._s32(Color.TRANSPARENT))
+        canvas.drawColor(GlassEngine._paint_color(0, 0, 0, 0)) # Прозрачный
         
-        # Пытаемся достать любые доступные обои из кэша Telegram
         wallpaper = None
         for method in["getCachedWallpaperNonBlocking", "getCachedWallpaper", "getWallpaperDrawable"]:
             try:
@@ -190,22 +191,19 @@ class GlassEngine:
             w = wallpaper.mutate() if hasattr(wallpaper, "mutate") else wallpaper
             GlassEngine._draw_center_crop(w, canvas, target_w, target_h)
         else:
-            # Если обоев нет, берем цвет чата
             try:
                 chat_bg = Theme.getColor(Theme.key_chat_wallpaper)
                 canvas.drawColor(GlassEngine._s32(chat_bg))
             except:
-                canvas.drawColor(GlassEngine._s32(Color.parseColor("#40000000")))
+                canvas.drawColor(GlassEngine._paint_color(64, 0, 0, 0))
 
-        # Накладываем слой затемнения
         if dim_alpha > 0:
             try:
                 p = Paint()
-                p.setColor(GlassEngine._s32(GlassEngine._with_alpha(Color.BLACK, dim_alpha)))
+                p.setColor(GlassEngine._paint_color(dim_alpha, 0, 0, 0))
                 canvas.drawRect(0, 0, target_w, target_h, p)
             except: pass
             
-        # Возвращаем исходный размер, растягивая картинку (что и создает эффект размытия)
         if factor > 1.0:
             try: bmp = Bitmap.createScaledBitmap(bmp, width, height, True)
             except: pass
@@ -213,7 +211,7 @@ class GlassEngine:
         return bmp
 
     # =========================================================
-    # ГЛАВНЫЙ РЕНДЕР (ULTRA 3D COMPOSITOR)
+    # ГЛАВНЫЙ РЕНДЕР
     # =========================================================
     @staticmethod
     def apply(view, context, glass_type, color_int, radius_dp, blur_radius=16, use_wallpaper=False):
@@ -230,96 +228,95 @@ class GlassEngine:
                     w, h = int(view.getWidth()), int(view.getHeight())
                     if w > 0 and h > 0:
                         dim = int(GlassEngine.RUNTIME.get("bg_dim", 0.14) * 255)
-                        
                         sdk = int(Build.SDK_INT)
-                        # Если у нас Android 12+ и работает RenderEffect в Core_plugin, мы не блюрим картинку здесь (передаем blur=0)
-                        # Но МЫ ОБЯЗАНЫ ЕЕ НАРИСОВАТЬ, иначе фон будет черным!
                         manual_blur = 0 if (sdk >= 31 and _HAS_RENDER_EFFECT) else int(GlassEngine.RUNTIME.get("bg_blur", 22))
-                        
                         bg_bmp = GlassEngine._build_wallpaper_bitmap(context, w, h, manual_blur, dim)
                         layers.append(BitmapDrawable(context.getResources(), bg_bmp))
                 except Exception as e: log(f"WP Draw Error: {e}")
 
-            # 2. БАЗОВЫЙ ЦВЕТ СТЕКЛА (Заливка)
+            # 2. БАЗОВЫЙ ЦВЕТ СТЕКЛА
             base_gd = GradientDrawable()
             base_gd.setCornerRadius(radius_px)
             base_gd.setColor(GlassEngine._s32(color_int))
             layers.append(base_gd)
 
-            # 3. ТЕКСТУРЫ (Шум или Сетка 3D)
+            # 3. ТЕКСТУРЫ (Шум или Сетка)
             if not use_wallpaper:
                 tex_bmp = None
                 if glass_type == GlassEngine.GLASS_RIBBED:
                     tex_bmp = GlassEngine._build_grid_bitmap(size=28)
                 elif glass_type == GlassEngine.GLASS_LIQUID:
-                    tex_bmp = GlassEngine._build_noise_bitmap(intensity=45) # Зернистое (сильный шум)
+                    tex_bmp = GlassEngine._build_noise_bitmap(intensity=45) # Сильный шум
                 elif glass_type == GlassEngine.GLASS_FROSTED:
-                    tex_bmp = GlassEngine._build_noise_bitmap(intensity=18) # Матовое (легкий шум)
+                    tex_bmp = GlassEngine._build_noise_bitmap(intensity=18) # Легкий шум
                 elif glass_type == GlassEngine.GLASS_GLOSSY:
-                    tex_bmp = None # Глянец без шума!
+                    tex_bmp = None # Глянец без шума
 
                 if tex_bmp:
                     tex_draw = BitmapDrawable(context.getResources(), tex_bmp)
                     tex_draw.setTileModeXY(ShaderTileMode.REPEAT, ShaderTileMode.REPEAT)
-                    
                     if _HAS_BLEND_MODE:
-                        try:
-                            # OVERLAY заставляет шум преломляться, а не просто лежать сверху
-                            tex_draw.setBlendMode(BlendMode.OVERLAY)
+                        try: tex_draw.setBlendMode(BlendMode.OVERLAY)
                         except: pass
                     layers.append(tex_draw)
 
-            # 4. ВНУТРЕННЕЕ 3D СВЕЧЕНИЕ И БЛИКИ
+            # 4. 3D ОБЪЕМ И БЛИКИ
             if not use_wallpaper:
                 glow_main = GradientDrawable()
                 glow_main.setCornerRadius(radius_px)
-                glow_main.setOrientation(GradientDrawable.Orientation.TL_BR)
                 
+                # Делаем блики гораздо более выраженными!
                 if glass_type == GlassEngine.GLASS_GLOSSY:
-                    # ГЛЯНЕЦ: Резкий диагональный блик-отражение
+                    # ГЛЯНЕЦ: Очень резкий диагональный блик (как на картинке 1)
+                    glow_main.setOrientation(GradientDrawable.Orientation.TL_BR)
                     glow_main.setColors(jarray(jint)([
-                        GlassEngine._s32(GlassEngine._with_alpha(Color.WHITE, int(high_alpha * 1.5))),
-                        GlassEngine._s32(GlassEngine._with_alpha(Color.WHITE, int(high_alpha * 0.4))),
-                        GlassEngine._s32(Color.TRANSPARENT),
-                        GlassEngine._s32(Color.TRANSPARENT),
-                        GlassEngine._s32(Color.TRANSPARENT),
-                        GlassEngine._s32(GlassEngine._with_alpha(Color.BLACK, int(high_alpha * 0.5)))
+                        GlassEngine._paint_color(min(255, int(high_alpha * 2.0)), 255, 255, 255),
+                        GlassEngine._paint_color(min(255, int(high_alpha * 0.8)), 255, 255, 255),
+                        GlassEngine._paint_color(0, 255, 255, 255),
+                        GlassEngine._paint_color(0, 0, 0, 0),
+                        GlassEngine._paint_color(int(high_alpha * 0.7), 0, 0, 0)
                     ]))
-                elif glass_type == GlassEngine.GLASS_LIQUID:
-                    # ЖИДКОСТЬ: Мягкие тени и сильный засвет
+                elif glass_type == GlassEngine.GLASS_FROSTED:
+                    # МАТОВОЕ: Равномерное "замыленное" свечение сверху вниз (как на картинке 2)
+                    glow_main.setOrientation(GradientDrawable.Orientation.TOP_BOTTOM)
                     glow_main.setColors(jarray(jint)([
-                        GlassEngine._s32(GlassEngine._with_alpha(Color.WHITE, int(high_alpha * 1.2))),
-                        GlassEngine._s32(Color.TRANSPARENT),
-                        GlassEngine._s32(GlassEngine._with_alpha(Color.BLACK, int(high_alpha * 0.6)))
+                        GlassEngine._paint_color(int(high_alpha * 1.2), 255, 255, 255),
+                        GlassEngine._paint_color(0, 255, 255, 255),
+                        GlassEngine._paint_color(int(high_alpha * 0.4), 0, 0, 0)
                     ]))
                 else: 
-                    # МАТОВОЕ / РИФЛЕНОЕ: Мягкое равномерное свечение сверху
+                    # LIQUID и RIBBED: Стандартная диагональ
+                    glow_main.setOrientation(GradientDrawable.Orientation.TL_BR)
                     glow_main.setColors(jarray(jint)([
-                        GlassEngine._s32(GlassEngine._with_alpha(Color.WHITE, high_alpha)),
-                        GlassEngine._s32(GlassEngine._with_alpha(Color.WHITE, int(high_alpha * 0.1))),
-                        GlassEngine._s32(Color.TRANSPARENT),
-                        GlassEngine._s32(GlassEngine._with_alpha(Color.BLACK, int(high_alpha * 0.3)))
+                        GlassEngine._paint_color(high_alpha, 255, 255, 255),
+                        GlassEngine._paint_color(int(high_alpha * 0.2), 255, 255, 255),
+                        GlassEngine._paint_color(0, 0, 0, 0),
+                        GlassEngine._paint_color(int(high_alpha * 0.4), 0, 0, 0)
                     ]))
                 layers.append(glow_main)
                 
-                # Вторичный рефлекс снизу (для глянца и жидкостей)
-                if glass_type in (GlassEngine.GLASS_GLOSSY, GlassEngine.GLASS_LIQUID):
+                # Вторичный рефлекс снизу (Важно для создания ощущения толщины)
+                if glass_type in (GlassEngine.GLASS_GLOSSY, GlassEngine.GLASS_LIQUID, GlassEngine.GLASS_FROSTED):
                     glow_sec = GradientDrawable()
                     glow_sec.setCornerRadius(radius_px)
                     glow_sec.setOrientation(GradientDrawable.Orientation.BOTTOM_TOP)
+                    # Снизу добавляем свет, отраженный от стола/экрана
                     glow_sec.setColors(jarray(jint)([
-                        GlassEngine._s32(GlassEngine._with_alpha(Color.WHITE, int(high_alpha * 0.6))),
-                        GlassEngine._s32(Color.TRANSPARENT), 
-                        GlassEngine._s32(Color.TRANSPARENT)
+                        GlassEngine._paint_color(int(high_alpha * 0.7), 255, 255, 255),
+                        GlassEngine._paint_color(0, 255, 255, 255)
                     ]))
                     layers.append(glow_sec)
 
-            # 5. ОСТРЫЕ ГРАНИ (Рамка карточки)
+            # 5. ОСТРЫЕ ГРАНИ (Рамка)
             if border_alpha > 0 and not use_wallpaper:
                 rim = GradientDrawable()
                 rim.setCornerRadius(radius_px)
-                rim.setColor(GlassEngine._s32(Color.TRANSPARENT))
-                rim.setStroke(AndroidUtilities.dp(1), GlassEngine._s32(GlassEngine._with_alpha(Color.WHITE, border_alpha)))
+                rim.setColor(GlassEngine._paint_color(0, 0, 0, 0))
+                # Глянец получает более яркую и тонкую рамку
+                if glass_type == GlassEngine.GLASS_GLOSSY:
+                    rim.setStroke(AndroidUtilities.dp(1), GlassEngine._paint_color(min(255, int(border_alpha * 1.5)), 255, 255, 255))
+                else:
+                    rim.setStroke(AndroidUtilities.dp(1), GlassEngine._paint_color(border_alpha, 255, 255, 255))
                 layers.append(rim)
 
             # СБОРКА СЛОЕВ
